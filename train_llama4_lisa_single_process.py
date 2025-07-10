@@ -58,6 +58,39 @@ from utils.utils import (
 )
 from utils.hf_auth import ensure_hf_login
 
+def create_loss_plots(loss_history, log_dir, exp_name):
+    """学習曲線の可視化（今回の目的：3種類の損失の減少確認）"""
+    if not loss_history:
+        return
+    
+    # 全エポックのデータを整理
+    epochs = list(range(1, len(loss_history) + 1))
+    total_losses = [epoch_data['total_loss'] for epoch_data in loss_history]
+    text_losses = [epoch_data['text_loss'] for epoch_data in loss_history]
+    dice_losses = [epoch_data['dice_loss'] for epoch_data in loss_history]
+    bce_losses = [epoch_data['bce_loss'] for epoch_data in loss_history]
+    
+    # 統合チャート（全損失を1つのグラフに）- メイン目的
+    plt.figure(figsize=(12, 8))
+    plt.plot(epochs, total_losses, 'b-', linewidth=2, marker='o', label='総損失')
+    plt.plot(epochs, text_losses, 'r-', linewidth=2, marker='s', label='テキスト損失')
+    plt.plot(epochs, dice_losses, 'g-', linewidth=2, marker='^', label='DICE損失')
+    plt.plot(epochs, bce_losses, 'm-', linewidth=2, marker='d', label='BCE損失')
+    
+    plt.title(f'LISA-Llama4 学習曲線検証 - {exp_name}', fontsize=14)
+    plt.xlabel('エポック')
+    plt.ylabel('損失値')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    
+    # 保存
+    plot_file = os.path.join(log_dir, f'loss_curves_{exp_name}.png')
+    plt.savefig(plot_file, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    return plot_file
+
 def setup_logging(log_dir: str):
     """ロギング設定"""
     logging.basicConfig(
@@ -236,13 +269,45 @@ def apply_lora_config(model, logger):
         raise
 
 def create_dataset_and_dataloader(model, args, logger):
-    """データセットとデータローダー作成"""
+    """データセットとデータローダー作成（段階的検証対応）"""
     logger.info("=== データセット初期化 ===")
     
-    # HybridDatasetの初期化（llama_processorを渡す）
-    dataset = HybridDataset(llama_processor=model.llama_processor)
+    # データセット種類の解析（既存のHybridDatasetインターフェースに合わせて変換）
+    if hasattr(args, 'dataset') and args.dataset:
+        datasets = [ds.strip() for ds in args.dataset.split(',')]
+        # HybridDatasetの期待する形式（"||"区切り）に変換
+        dataset_string = "||".join(datasets)
+    else:
+        dataset_string = "reason_seg"  # デフォルト
+    
+    logger.info(f"対象データセット: {datasets if 'datasets' in locals() else [dataset_string]}")
+    
+    # 各データセットのサンプル数制御
+    samples_per_dataset = getattr(args, 'samples_per_dataset', None)
+    if samples_per_dataset:
+        logger.info(f"サンプル数制限: {samples_per_dataset}")
+        # samples_per_datasetからsamples_per_epochを計算
+        # データセット数 × サンプル数で概算
+        dataset_count = len(datasets) if 'datasets' in locals() else 1
+        samples_per_epoch = samples_per_dataset * dataset_count
+    else:
+        # デフォルトは小さめに設定（段階的検証用）
+        samples_per_epoch = 500  # 既存のデフォルトから大幅削減
+    
+    logger.info(f"エポックあたりのサンプル数: {samples_per_epoch}")
+    
+    # HybridDatasetの初期化（既存インターフェース使用）
+    dataset = HybridDataset(
+        llama_processor=model.llama_processor,
+        dataset=dataset_string,
+        samples_per_epoch=samples_per_epoch
+    )
     
     logger.info(f"✓ データセット初期化完了: {len(dataset)} サンプル")
+    
+    # データセット構成の詳細表示
+    if hasattr(dataset, 'datasets'):
+        logger.info(f"データセット構成: {dataset.datasets}")
     
     # DataLoader作成
     dataloader = DataLoader(
@@ -311,16 +376,28 @@ def get_model_device(model):
         raise RuntimeError("Model Parallelismが設定されていません。103Bモデルには必須です。")
 
 def train_epoch(model, dataloader, optimizer, scheduler, epoch, args, logger, writer=None):
-    """1エポックの学習実行（overfit成功パターン）"""
+    """1エポックの学習実行（個別損失トラッキング付き）"""
     model.train()
     
-    # メトリクス初期化
-    losses = AverageMeter('Loss', ':.4e')
+    # 個別損失メトリクス初期化
+    total_losses = AverageMeter('Total', ':.4e')
+    text_losses = AverageMeter('Text', ':.4e')
+    dice_losses = AverageMeter('DICE', ':.4e')
+    bce_losses = AverageMeter('BCE', ':.4e')
+    
     progress = ProgressMeter(
         len(dataloader) if args.steps_per_epoch is None else args.steps_per_epoch,
-        [losses],
+        [total_losses],  # 表示は総損失のみでシンプルに
         prefix=f"Epoch: [{epoch}]"
     )
+    
+    # 個別損失履歴（エポック内）
+    epoch_loss_history = {
+        'total_loss': [],
+        'text_loss': [],
+        'dice_loss': [],
+        'bce_loss': []
+    }
     
     start_time = time.time()
     
@@ -383,37 +460,99 @@ def train_epoch(model, dataloader, optimizer, scheduler, epoch, args, logger, wr
         
         model_outputs = model(**model_inputs)
         
-        # CompositeLoss統合による損失取得（成功パターン完全移植）
-        if isinstance(model_outputs, dict):
-            # CompositeLossからの統一損失
-            if 'text_loss' in model_outputs:
-                loss = model_outputs['text_loss']
-            # 予備処理：lossキーも確認
-            elif 'loss' in model_outputs:
-                loss = model_outputs['loss']
-            # フォールバック：手動計算
+        # 個別損失を取得（CompositeLoss統合対応）
+        individual_losses = {'total_loss': 0, 'text_loss': 0, 'dice_loss': 0, 'bce_loss': 0}
+        
+        # デバッグ: モデル出力のキーを確認（初回のみ）
+        if step == 0:
+            if isinstance(model_outputs, dict):
+                logger.info(f"  🔍 モデル出力キー: {list(model_outputs.keys())}")
             else:
-                logits = model_outputs.get('logits')
-                if logits is None:
-                    raise ValueError("logitsが見つかりません")
+                logger.info(f"  🔍 モデル出力タイプ: {type(model_outputs)}")
+        
+        if isinstance(model_outputs, dict):
+            # CompositeLossからの総損失を取得（フォールバック処理なし）
+            
+            # 1. 直接total_lossを確認
+            if 'total_loss' in model_outputs:
+                loss = model_outputs['total_loss']
+                individual_losses['total_loss'] = loss.item()
+                if step == 0:
+                    logger.info(f"  ✓ total_loss取得成功: {individual_losses['total_loss']:.4f}")
+            
+            # 2. losses辞書内のtotal_lossを確認
+            elif 'losses' in model_outputs and isinstance(model_outputs['losses'], dict):
+                losses_dict = model_outputs['losses']
+                if 'total_loss' in losses_dict:
+                    loss = losses_dict['total_loss']
+                    individual_losses['total_loss'] = loss.item()
+                    if step == 0:
+                        logger.info(f"  ✓ losses辞書内total_loss取得成功: {individual_losses['total_loss']:.4f}")
+                else:
+                    raise ValueError(f"losses辞書にtotal_lossが見つかりません。利用可能なキー: {list(losses_dict.keys())}")
+            
+            # 3. エラー：total_lossが見つからない
+            else:
+                available_keys = list(model_outputs.keys())
+                raise ValueError(f"total_lossが見つかりません。モデル出力キー: {available_keys}")
+            
+            # 個別損失の確認も同様に厳密化
+            
+            # 個別損失の詳細を取得（厳密チェック）
+            if 'losses' in model_outputs and isinstance(model_outputs['losses'], dict):
+                losses_dict = model_outputs['losses']
+                if step == 0:
+                    logger.info(f"  🔍 losses辞書キー: {list(losses_dict.keys())}")
                 
-                # 言語モデリング損失を手動計算
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = batch["input_ids"][..., 1:].contiguous()
-                loss_fct = nn.CrossEntropyLoss()
-                loss = loss_fct(
-                    shift_logits.view(-1, shift_logits.size(-1)), 
-                    shift_labels.view(-1)
-                )
+                # text_loss
+                if 'text_loss' in losses_dict and losses_dict['text_loss'] is not None:
+                    individual_losses['text_loss'] = losses_dict['text_loss'].item()
+                    if step == 0:
+                        logger.info(f"  ✓ text_loss取得成功: {individual_losses['text_loss']:.4f}")
+                else:
+                    raise ValueError(f"text_lossが見つかりません。losses辞書キー: {list(losses_dict.keys())}")
+                
+                # dice_loss
+                if 'dice_loss' in losses_dict and losses_dict['dice_loss'] is not None:
+                    individual_losses['dice_loss'] = losses_dict['dice_loss'].item()
+                    if step == 0:
+                        logger.info(f"  ✓ dice_loss取得成功: {individual_losses['dice_loss']:.4f}")
+                else:
+                    raise ValueError(f"dice_lossが見つかりません。losses辞書キー: {list(losses_dict.keys())}")
+                
+                # bce_loss
+                if 'bce_loss' in losses_dict and losses_dict['bce_loss'] is not None:
+                    individual_losses['bce_loss'] = losses_dict['bce_loss'].item()
+                    if step == 0:
+                        logger.info(f"  ✓ bce_loss取得成功: {individual_losses['bce_loss']:.4f}")
+                else:
+                    raise ValueError(f"bce_lossが見つかりません。losses辞書キー: {list(losses_dict.keys())}")
+            else:
+                raise ValueError("losses辞書が見つかりません")
         else:
             # 非辞書型出力の場合
             if hasattr(model_outputs, 'loss'):
                 loss = model_outputs.loss
+                individual_losses['total_loss'] = loss.item()
             else:
-                raise ValueError("損失が見つかりません")
+                raise ValueError(f"モデル出力から損失が見つかりません。タイプ: {type(model_outputs)}")
+        
+        # メモリクリアしてから逆伝播（CUBLAS_STATUS_ALLOC_FAILED対策）
+        torch.cuda.empty_cache()
         
         # 逆伝播
-        loss.backward()
+        try:
+            loss.backward()
+        except RuntimeError as e:
+            if "CUBLAS_STATUS_ALLOC_FAILED" in str(e):
+                logger.error("❌ CUDA/CUBLAS メモリ不足エラー")
+                logger.error("💡 対策:")
+                logger.error("  1. --steps_per_epoch を小さくする（例: --steps_per_epoch 10）")
+                logger.error("  2. gradient_accumulation_steps の使用を検討")
+                logger.error("  3. より小さなデータセットで検証")
+                raise
+            else:
+                raise
         
         # 勾配クリッピング
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.clip_grad_norm)
@@ -422,17 +561,41 @@ def train_epoch(model, dataloader, optimizer, scheduler, epoch, args, logger, wr
         optimizer.step()
         scheduler.step()
         
-        # メトリクス更新
-        losses.update(loss.item(), batch['input_ids'].size(0))
+        # 個別メトリクス更新
+        batch_size = batch['input_ids'].size(0)
+        total_losses.update(individual_losses['total_loss'], batch_size)
+        text_losses.update(individual_losses['text_loss'], batch_size)
+        dice_losses.update(individual_losses['dice_loss'], batch_size)
+        bce_losses.update(individual_losses['bce_loss'], batch_size)
         
-        # ログ出力
+        # エポック内損失履歴に追加
+        epoch_loss_history['total_loss'].append(individual_losses['total_loss'])
+        epoch_loss_history['text_loss'].append(individual_losses['text_loss'])
+        epoch_loss_history['dice_loss'].append(individual_losses['dice_loss'])
+        epoch_loss_history['bce_loss'].append(individual_losses['bce_loss'])
+        
+        # 学習進行度とログ出力
         if step % args.print_freq == 0:
-            progress.display(step)
+            # 一般的な進行度表示
+            total_steps = args.steps_per_epoch if args.steps_per_epoch else len(dataloader)
+            progress_pct = (step + 1) / total_steps * 100
+            elapsed_time = time.time() - start_time
+            eta = elapsed_time / (step + 1) * (total_steps - step - 1) if step > 0 else 0
+            
+            logger.info(f"🚀 Epoch [{epoch+1}] Step [{step+1:3d}/{total_steps}] ({progress_pct:5.1f}%) "
+                       f"ETA: {eta/60:.1f}min | "
+                       f"Total: {individual_losses['total_loss']:6.3f} | "
+                       f"Text: {individual_losses['text_loss']:6.3f} | "
+                       f"DICE: {individual_losses['dice_loss']:6.3f} | "
+                       f"BCE: {individual_losses['bce_loss']:6.3f}")
             
             # TensorBoard記録
             if writer is not None:
                 global_step = epoch * len(dataloader) + step
-                writer.add_scalar('Train/Loss', losses.val, global_step)
+                writer.add_scalar('Train/TotalLoss', total_losses.val, global_step)
+                writer.add_scalar('Train/TextLoss', text_losses.val, global_step)
+                writer.add_scalar('Train/DiceLoss', dice_losses.val, global_step)
+                writer.add_scalar('Train/BCELoss', bce_losses.val, global_step)
                 writer.add_scalar('Train/LR', scheduler.get_last_lr()[0], global_step)
         
         # メモリクリーンアップ
@@ -441,9 +604,20 @@ def train_epoch(model, dataloader, optimizer, scheduler, epoch, args, logger, wr
         gc.collect()
     
     epoch_time = time.time() - start_time
-    logger.info(f"✓ エポック {epoch} 完了: 平均損失={losses.avg:.4f}, 時間={epoch_time:.1f}秒")
+    logger.info(f"✓ エポック {epoch} 完了:")
+    logger.info(f"  - 総損失: {total_losses.avg:.4f}")
+    logger.info(f"  - テキスト損失: {text_losses.avg:.4f}")
+    logger.info(f"  - DICE損失: {dice_losses.avg:.4f}")
+    logger.info(f"  - BCE損失: {bce_losses.avg:.4f}")
+    logger.info(f"  - 時間: {epoch_time:.1f}秒")
     
-    return losses.avg
+    return {
+        'total_loss': total_losses.avg,
+        'text_loss': text_losses.avg,
+        'dice_loss': dice_losses.avg,
+        'bce_loss': bce_losses.avg,
+        'epoch_loss_history': epoch_loss_history
+    }
 
 def main():
     parser = argparse.ArgumentParser(description="LISA-Llama4 シングルプロセス学習（overfit成功パターン移植）")
@@ -458,6 +632,16 @@ def main():
     parser.add_argument("--print_freq", type=int, default=10, help="ログ出力頻度")
     parser.add_argument("--save_freq", type=int, default=1, help="チェックポイント保存頻度")
     parser.add_argument("--steps_per_epoch", type=int, default=None, help="エポックあたりのステップ数（制限）")
+    
+    # 段階的検証用追加設定
+    parser.add_argument("--dataset", type=str, default="reason_seg", 
+                       help="データセット種類（カンマ区切り）: reason_seg,refer_seg,vqa,sem_seg")
+    parser.add_argument("--samples_per_dataset", type=int, default=None,
+                       help="各データセットのサンプル数制限")
+    parser.add_argument("--visualize_losses", action="store_true", default=True,
+                       help="学習曲線可視化を有効化")
+    parser.add_argument("--plot_interval", type=int, default=1,
+                       help="学習曲線プロット更新間隔（エポック）")
     
     args = parser.parse_args()
     
@@ -517,12 +701,60 @@ def main():
         # TensorBoard
         writer = SummaryWriter(f"./runs/{args.exp_name}_{timestamp}")
         
+        # 学習履歴記録用
+        loss_history = []
+        
         # 学習ループ
         for epoch in range(args.epochs):
-            avg_loss = train_epoch(
+            epoch_results = train_epoch(
                 model, dataloader, optimizer, scheduler, 
                 epoch, args, logger, writer
             )
+            
+            # 学習履歴に追加
+            loss_history.append(epoch_results)
+            
+            # 学習曲線の可視化（指定間隔で実行）
+            if args.visualize_losses and (epoch + 1) % args.plot_interval == 0:
+                logger.info(f"学習曲線を更新中... (エポック {epoch + 1})")
+                try:
+                    plot_file = create_loss_plots(loss_history, log_dir, args.exp_name)
+                    if plot_file:
+                        logger.info(f"✓ 学習曲線を保存: {plot_file}")
+                except Exception as e:
+                    logger.warning(f"学習曲線の生成に失敗: {e}")
+            
+            # 損失改善状況の報告
+            if len(loss_history) >= 2:
+                prev_total = loss_history[-2]['total_loss']
+                curr_total = loss_history[-1]['total_loss']
+                improvement = prev_total - curr_total
+                improvement_pct = (improvement / prev_total) * 100 if prev_total > 0 else 0
+                
+                logger.info(f"📊 損失改善状況:")
+                change = curr_total - prev_total
+                change_pct = (change / prev_total) * 100 if prev_total > 0 else 0
+                logger.info(f"  - 総損失: {prev_total:.4f} → {curr_total:.4f} ({change:+.4f}, {change_pct:+.1f}%)")
+                
+                # 個別損失の改善も報告
+                for loss_type in ['text_loss', 'dice_loss', 'bce_loss']:
+                    if loss_type in loss_history[-1] and loss_type in loss_history[-2]:
+                        prev_val = loss_history[-2][loss_type]
+                        curr_val = loss_history[-1][loss_type]
+                        if prev_val > 0:
+                            change = curr_val - prev_val
+                            change_pct = (change / prev_val) * 100
+                            logger.info(f"  - {loss_type}: {prev_val:.4f} → {curr_val:.4f} ({change:+.4f}, {change_pct:+.1f}%)")
+            
+            # 最終可視化
+            if epoch == args.epochs - 1:
+                logger.info("最終学習曲線を生成中...")
+                try:
+                    plot_file = create_loss_plots(loss_history, log_dir, args.exp_name)
+                    if plot_file:
+                        logger.info(f"✓ 最終学習曲線を保存: {plot_file}")
+                except Exception as e:
+                    logger.warning(f"最終学習曲線の生成に失敗: {e}")
             
             # チェックポイント保存
             if epoch % args.save_freq == 0:
@@ -554,16 +786,58 @@ def main():
                     'model_state_dict': model_state_dict,
                     'optimizer_state_dict': optimizer.state_dict(),
                     'scheduler_state_dict': scheduler.state_dict(),
-                    'loss': avg_loss,
+                    'loss_history': loss_history,
+                    'current_epoch_loss': epoch_results,
                 }, f"{checkpoint_dir}/checkpoint_epoch_{epoch}.pt")
                 
                 logger.info(f"✓ チェックポイント保存: epoch_{epoch}.pt")
         
+        # 最終学習レポート
         logger.info("=" * 80)
-        logger.info("✅ 学習完了!")
-        logger.info(f"ログディレクトリ: {log_dir}")
-        logger.info(f"チェックポイント: ./checkpoints/{args.exp_name}")
-        logger.info(f"TensorBoard: tensorboard --logdir=./runs/{args.exp_name}_{timestamp}")
+        logger.info("✅ LISA-Llama4 段階的検証学習完了!")
+        logger.info("=" * 80)
+        
+        # 学習結果サマリー
+        if loss_history:
+            initial_loss = loss_history[0]
+            final_loss = loss_history[-1]
+            
+            logger.info("📊 学習結果サマリー:")
+            logger.info(f"  対象データセット: {args.dataset}")
+            if args.samples_per_dataset:
+                logger.info(f"  サンプル数制限: {args.samples_per_dataset}/データセット")
+            logger.info(f"  総エポック数: {args.epochs}")
+            
+            logger.info("📈 損失変化:")
+            for loss_type in ['total_loss', 'text_loss', 'dice_loss', 'bce_loss']:
+                if loss_type in initial_loss and loss_type in final_loss:
+                    init_val = initial_loss[loss_type]
+                    final_val = final_loss[loss_type]
+                    change = final_val - init_val
+                    change_pct = (change / init_val) * 100 if init_val > 0 else 0
+                    trend = "📉" if change < 0 else "📈" if change > 0 else "➡️"
+                    logger.info(f"  - {loss_type}: {init_val:.4f} → {final_val:.4f} {trend} ({change:+.4f}, {change_pct:+.1f}%)")
+            
+            # 学習成功判定
+            total_improvement = initial_loss['total_loss'] - final_loss['total_loss']
+            improvement_pct = (total_improvement / initial_loss['total_loss']) * 100 if initial_loss['total_loss'] > 0 else 0
+            
+            if improvement_pct > 10:
+                logger.info("🎉 優秀な学習結果 - 総損失が10%以上改善!")
+            elif improvement_pct > 5:
+                logger.info("✅ 良好な学習結果 - 総損失が5%以上改善")
+            elif improvement_pct > 0:
+                logger.info("📊 学習進行中 - 総損失が改善傾向")
+            else:
+                logger.info("⚠️ 学習要調整 - 損失改善が見られない可能性")
+        
+        logger.info("📁 出力ファイル:")
+        logger.info(f"  - ログディレクトリ: {log_dir}")
+        logger.info(f"  - チェックポイント: ./checkpoints/{args.exp_name}")
+        logger.info(f"  - TensorBoard: tensorboard --logdir=./runs/{args.exp_name}_{timestamp}")
+        if args.visualize_losses:
+            logger.info(f"  - 学習曲線: {log_dir}/loss_curves_{args.exp_name}.png")
+        
         logger.info("=" * 80)
         
         writer.close()
